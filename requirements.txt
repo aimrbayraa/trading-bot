@@ -1,0 +1,12 @@
+flask
+flask-socketio
+flask-cors
+eventlet
+ccxt
+pandas
+pandas-ta
+numpy
+scikit-learn
+joblib
+requests
+anthropic
