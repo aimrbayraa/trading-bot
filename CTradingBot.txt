@@ -1,0 +1,1811 @@
+"""
+═══════════════════════════════════════════════════════════════════
+  ADAPTIVE AI TRADING BOT v3.0 — CLAUDE AI + SCALP + ВЭБ
+  Binance Futures дээр AI-аар арилжаалдаг бот
+  Баланс: 15$-50$ | Scalp горим | Бага эрсдэл
+═══════════════════════════════════════════════════════════════════
+  Ажиллуулах:
+    pip install flask flask-socketio flask-cors eventlet ccxt pandas pandas_ta numpy scikit-learn joblib requests anthropic
+    python trading_bot.py
+
+  Хөтөч: http://localhost:5000
+  Нэвтрэх: admin / admin123
+═══════════════════════════════════════════════════════════════════
+"""
+import eventlet
+eventlet.monkey_patch()
+
+import os
+import json
+import time
+import logging
+import threading
+import sqlite3
+import hashlib
+from datetime import datetime, date, timedelta
+from pathlib import Path
+from collections import deque
+
+import numpy as np
+import pandas as pd
+import requests
+import ccxt
+
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session
+from flask_socketio import SocketIO
+from flask_cors import CORS
+
+# ════════════════════════════════════════════════════════════════
+# 1. ЛОГ ТОХИРГОО
+# ════════════════════════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger('bot')
+
+# ════════════════════════════════════════════════════════════════
+# 2. КОНФИГ
+# ════════════════════════════════════════════════════════════════
+CONFIG_FILE = 'bot_config.json'
+USERS_FILE = 'users.json'
+DB_FILE = 'trading_bot.db'
+
+DEFAULT_CONFIG = {
+    "TESTNET": True,
+    "API_KEY": "",
+    "API_SECRET": "",
+    "LEVERAGE": 5,
+    "MAX_RISK_PER_TRADE": 0.015,
+    "DAILY_LOSS_LIMIT": 0.05,
+    "DAILY_PROFIT_TARGET": 0.03,
+    "MAX_POSITIONS": 1,
+    "MAX_TRADES_PER_DAY": 20,
+    "GLOBAL_COOLDOWN": 20,
+    "AI_CONFIDENCE_THRESHOLD": 0.62,
+    "AI_RETRAIN_INTERVAL": 7200,
+    "SYMBOLS": ["SOL/USDT:USDT", "XRP/USDT:USDT", "ETH/USDT:USDT"],
+    "TELEGRAM_TOKEN": "",
+    "CHAT_ID": "",
+    "USE_TRAILING": True,
+    "TRAILING_TRIGGER": 0.003,
+    "TRAILING_DISTANCE": 0.0015,
+    "MIN_BALANCE": 15,
+    "MAX_BALANCE_USE": 50,
+    "SCALP_MODE": True,
+    "USE_CLAUDE": False,
+    "CLAUDE_API_KEY": "",
+    "CLAUDE_MODEL": "claude-opus-4-20250514"
+}
+
+def load_config():
+    if Path(CONFIG_FILE).exists():
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            for k, v in DEFAULT_CONFIG.items():
+                cfg.setdefault(k, v)
+            return cfg
+        except Exception as e:
+            log.error(f"Config уншиж чадсангүй: {e}")
+    save_config(DEFAULT_CONFIG)
+    return DEFAULT_CONFIG.copy()
+
+def save_config(cfg):
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+CONFIG = load_config()
+
+# ════════════════════════════════════════════════════════════════
+# 3. НЭВТРЭЛ
+# ════════════════════════════════════════════════════════════════
+def hash_password(password):
+    return hashlib.sha256((password + "mnbot_2024_salt").encode()).hexdigest()
+
+def init_users():
+    if not Path(USERS_FILE).exists():
+        users = {"admin": hash_password("admin123")}
+        with open(USERS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(users, f)
+        log.info("✅ Default хэрэглэгч үүслээ: admin / admin123")
+
+def check_login(username, password):
+    init_users()
+    try:
+        with open(USERS_FILE, 'r', encoding='utf-8') as f:
+            users = json.load(f)
+        return username in users and users[username] == hash_password(password)
+    except Exception as e:
+        log.error(f"Login шалгахад алдаа: {e}")
+        return False
+
+init_users()
+
+# ════════════════════════════════════════════════════════════════
+# 4. ӨГӨГДЛИЙН САН — SQLite
+# ════════════════════════════════════════════════════════════════
+_db_lock = threading.RLock()
+
+def get_db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with _db_lock:
+        conn = get_db()
+        conn.executescript('''
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT, side TEXT, strategy TEXT,
+                entry REAL, sl REAL, tp REAL, exit_price REAL,
+                qty REAL, pnl REAL DEFAULT 0, pnl_pct REAL DEFAULT 0,
+                score INTEGER, opened_at TEXT, closed_at TEXT,
+                status TEXT DEFAULT 'open', leverage INTEGER DEFAULT 5,
+                notes TEXT
+            );
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, level TEXT, message TEXT
+            );
+            CREATE TABLE IF NOT EXISTS predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT, symbol TEXT, signal TEXT, confidence REAL, expected_return REAL
+            );
+        ''')
+        conn.commit()
+        conn.close()
+
+def db_add_trade(symbol, side, strategy, entry, sl, tp, qty, score, leverage):
+    with _db_lock:
+        conn = get_db()
+        cur = conn.execute('''INSERT INTO trades
+            (symbol, side, strategy, entry, sl, tp, qty, score, opened_at, status, leverage)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+            (symbol, side, strategy, entry, sl, tp, qty, score,
+             datetime.now().isoformat(), 'open', leverage))
+        tid = cur.lastrowid
+        conn.commit()
+        conn.close()
+        return tid
+
+def db_close_trade(trade_id, exit_price, pnl, pnl_pct, notes=''):
+    with _db_lock:
+        conn = get_db()
+        conn.execute('''UPDATE trades
+            SET status='closed', exit_price=?, pnl=?, pnl_pct=?, closed_at=?, notes=?
+            WHERE id=?''',
+            (exit_price, pnl, pnl_pct, datetime.now().isoformat(), notes, trade_id))
+        conn.commit()
+        conn.close()
+
+def db_get_trades(limit=50, status=None):
+    with _db_lock:
+        conn = get_db()
+        if status:
+            rows = conn.execute(
+                'SELECT * FROM trades WHERE status=? ORDER BY id DESC LIMIT ?',
+                (status, limit)).fetchall()
+        else:
+            rows = conn.execute(
+                'SELECT * FROM trades ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+def db_add_log(level, msg):
+    with _db_lock:
+        try:
+            conn = get_db()
+            conn.execute('INSERT INTO logs (ts, level, message) VALUES (?,?,?)',
+                (datetime.now().isoformat(), level, msg))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+def db_get_logs(limit=100):
+    with _db_lock:
+        conn = get_db()
+        rows = conn.execute(
+            'SELECT * FROM logs ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+        conn.close()
+        return [dict(r) for r in rows][::-1]
+
+def db_add_prediction(symbol, signal, confidence, expected):
+    with _db_lock:
+        conn = get_db()
+        conn.execute('''INSERT INTO predictions
+            (ts, symbol, signal, confidence, expected_return)
+            VALUES (?,?,?,?,?)''',
+            (datetime.now().isoformat(), symbol, signal, confidence, expected))
+        conn.commit()
+        conn.close()
+
+def db_get_stats():
+    with _db_lock:
+        conn = get_db()
+        total = conn.execute('SELECT COUNT(*) FROM trades').fetchone()[0]
+        wins = conn.execute("SELECT COUNT(*) FROM trades WHERE pnl>0").fetchone()[0]
+        losses = conn.execute("SELECT COUNT(*) FROM trades WHERE pnl<0").fetchone()[0]
+        total_pnl = conn.execute(
+            "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE status='closed'").fetchone()[0]
+        conn.close()
+        return {
+            'total': total, 'wins': wins, 'losses': losses,
+            'winrate': (wins/total*100) if total else 0,
+            'total_pnl': total_pnl
+        }
+
+init_db()
+
+# ════════════════════════════════════════════════════════════════
+# 5. AI СТРАТЕГИ — Feature инженерчлэл + Model
+# ════════════════════════════════════════════════════════════════
+class FeatureEngineer:
+    def build_features(self, df_15m, df_1h, df_4h):
+        f = {}
+        try:
+            closes = df_15m['c'].values.astype(float)
+            highs = df_15m['h'].values.astype(float)
+            lows = df_15m['l'].values.astype(float)
+            opens = df_15m['o'].values.astype(float)
+            vols = df_15m['v'].values.astype(float)
+        except Exception as e:
+            log.error(f"Feature build: мэдээлэл буруу {e}")
+            return {}
+
+        for n in [1, 3, 5, 10, 20]:
+            if len(closes) > n:
+                f[f'ret_{n}'] = (closes[-1] - closes[-n-1]) / closes[-n-1]
+            else:
+                f[f'ret_{n}'] = 0
+
+        f['volatility_20'] = pd.Series(closes[-20:]).pct_change().std() if len(closes) > 20 else 0
+        f['hl_range'] = (highs[-1] - lows[-1]) / closes[-1] if closes[-1] else 0
+        f['body_ratio'] = abs(closes[-1] - opens[-1]) / (highs[-1] - lows[-1] + 1e-9)
+        f['upper_wick'] = (highs[-1] - max(closes[-1], opens[-1])) / closes[-1]
+        f['lower_wick'] = (min(closes[-1], opens[-1]) - lows[-1]) / closes[-1]
+
+        try:
+            import pandas_ta as ta
+            df = df_15m.copy()
+            df['EMA9'] = ta.ema(df['c'], length=9)
+            df['EMA21'] = ta.ema(df['c'], length=21)
+            df['EMA50'] = ta.ema(df['c'], length=50)
+            df['RSI'] = ta.rsi(df['c'], length=14)
+            df['ATR'] = ta.atr(df['h'], df['l'], df['c'], length=14)
+
+            macd = ta.macd(df['c'], fast=12, slow=26, signal=9)
+            if macd is not None:
+                df = pd.concat([df, macd], axis=1)
+
+            bb = ta.bbands(df['c'], length=20, std=2)
+            if bb is not None:
+                df = pd.concat([df, bb], axis=1)
+
+            adx = ta.adx(df['h'], df['l'], df['c'], length=14)
+            if adx is not None:
+                df['ADX_14'] = adx['ADX_14']
+
+            stoch = ta.stoch(df['h'], df['l'], df['c'])
+            if stoch is not None:
+                df = pd.concat([df, stoch], axis=1)
+
+            last = df.iloc[-1]
+            f['rsi'] = last.get('RSI', 50) or 50
+            f['atr_pct'] = (last.get('ATR', 0) or 0) / closes[-1]
+            f['ema9_21_diff'] = ((last['EMA9'] or 0) - (last['EMA21'] or 0)) / closes[-1]
+            f['price_ema21_diff'] = (closes[-1] - (last['EMA21'] or closes[-1])) / closes[-1]
+            f['macd_hist'] = last.get('MACDh_12_26_9', 0) or 0
+            f['adx'] = last.get('ADX_14', 0) or 0
+            f['stoch_k'] = last.get('STOCHk_14_3_3', 50) or 50
+
+            if 'BBU_20_2.0' in df.columns and 'BBL_20_2.0' in df.columns:
+                bbu = last.get('BBU_20_2.0') or closes[-1]
+                bbl = last.get('BBL_20_2.0') or closes[-1]
+                f['bb_position'] = (closes[-1] - bbl) / (bbu - bbl + 1e-9)
+            else:
+                f['bb_position'] = 0.5
+        except Exception as e:
+            log.warning(f"pandas_ta алдаа: {e}")
+            for k in ['rsi', 'atr_pct', 'ema9_21_diff', 'price_ema21_diff',
+                     'macd_hist', 'adx', 'stoch_k', 'bb_position']:
+                f[k] = 0
+
+        if len(vols) > 20:
+            f['vol_ratio'] = vols[-1] / (np.mean(vols[-20:]) + 1e-9)
+        else:
+            f['vol_ratio'] = 1
+
+        if df_1h is not None and len(df_1h) > 50:
+            try:
+                import pandas_ta as ta
+                df1 = df_1h.copy()
+                df1['EMA50'] = ta.ema(df1['c'], length=50)
+                df1['EMA200'] = ta.ema(df1['c'], length=200)
+                f['1h_ema_diff'] = ((df1['EMA50'].iloc[-1] or 0) -
+                                    (df1['EMA200'].iloc[-1] or 0)) / df1['c'].iloc[-1]
+                f['1h_rsi'] = (ta.rsi(df1['c'], length=14).iloc[-1] or 50)
+            except Exception:
+                f['1h_ema_diff'] = 0
+                f['1h_rsi'] = 50
+        else:
+            f['1h_ema_diff'] = 0
+            f['1h_rsi'] = 50
+
+        now = datetime.utcnow()
+        f['hour_sin'] = np.sin(2 * np.pi * now.hour / 24)
+        f['hour_cos'] = np.cos(2 * np.pi * now.hour / 24)
+
+        return f
+
+
+class AIStrategy:
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.is_trained = False
+        self.accuracy = 0.0
+        self.total_predictions = 0
+        self.correct_predictions = 0
+        self.recent_accuracy = deque(maxlen=100)
+
+    def train(self, symbol='BTC/USDT:USDT', days=30):
+        log.info(f"📚 AI сургалт эхлэв: {symbol} ({days} хоног)")
+        try:
+            from sklearn.ensemble import RandomForestClassifier
+            import pandas_ta as ta
+            import joblib
+
+            ex = ccxt.binance({'enableRateLimit': True})
+            since = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+            bars = []
+            log.info(f"📥 {symbol} мэдээлэл татаж байна...")
+
+            while True:
+                b = ex.fetch_ohlcv(symbol, '15m', since=since, limit=1000)
+                if not b:
+                    break
+                bars.extend(b)
+                since = b[-1][0] + 1
+                if len(b) < 1000:
+                    break
+                if len(bars) > 5000:
+                    break
+
+            if len(bars) < 500:
+                log.error(f"Мэдээлэл хангалтгүй: {len(bars)} баар")
+                return False
+
+            log.info(f"✅ {len(bars)} баар татлаа")
+
+            df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+            df['t'] = pd.to_datetime(df['t'], unit='ms')
+
+            # Scalp шошго (2 баар, 0.1%)
+            df['future'] = df['c'].shift(-2)
+            df['ret'] = (df['future'] - df['c']) / df['c']
+            df['label'] = 0
+            df.loc[df['ret'] > 0.001, 'label'] = 1
+            df.loc[df['ret'] < -0.001, 'label'] = 2
+
+            try:
+                bars_1h = ex.fetch_ohlcv(symbol, '1h', limit=500)
+                df_1h = pd.DataFrame(bars_1h, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+            except Exception:
+                df_1h = None
+
+            fe = FeatureEngineer()
+            X_list, y_list = [], []
+            log.info("🔧 Шинж чанар тооцоолж байна...")
+
+            for i in range(60, len(df) - 4):
+                if df.iloc[i]['label'] == 0 and (i % 3 != 0):
+                    continue
+                try:
+                    s15 = df.iloc[max(0, i-100):i+1].reset_index(drop=True)
+                    if df_1h is not None:
+                        s1h = df_1h[df_1h['t'] <= df.iloc[i]['t']].tail(100).reset_index(drop=True)
+                    else:
+                        s1h = None
+                    feats = fe.build_features(s15, s1h, None)
+                    if feats:
+                        X_list.append(feats)
+                        y_list.append(int(df.iloc[i]['label']))
+                except Exception:
+                    continue
+
+            if len(X_list) < 100:
+                log.error(f"Шинж чанар хангалтгүй: {len(X_list)}")
+                return False
+
+            X = pd.DataFrame(X_list).fillna(0)
+            y = np.array(y_list)
+            self.feature_names = list(X.columns)
+
+            log.info(f"✅ {len(X)} сургалтын дээж, {len(self.feature_names)} шинж чанар")
+
+            split = int(len(X) * 0.8)
+            X_train, X_test = X.iloc[:split], X.iloc[split:]
+            y_train, y_test = y[:split], y[split:]
+
+            self.model = RandomForestClassifier(
+                n_estimators=200, max_depth=10,
+                min_samples_leaf=20, class_weight='balanced',
+                random_state=42, n_jobs=-1
+            )
+            self.model.fit(X_train, y_train)
+            acc = (self.model.predict(X_test) == y_test).mean()
+            self.accuracy = acc
+            self.is_trained = True
+
+            joblib.dump({'model': self.model, 'features': self.feature_names}, 'ai_model.pkl')
+            log.info(f"✅ AI сурлаа: accuracy={acc*100:.1f}%, {len(X)} дээж")
+            return True
+        except Exception as e:
+            log.error(f"Train алдаа: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def predict(self, df_15m, df_1h, df_4h):
+        if not self.is_trained or self.model is None:
+            return None
+        try:
+            fe = FeatureEngineer()
+            f = fe.build_features(df_15m, df_1h, df_4h)
+            if not f:
+                return None
+
+            for c in self.feature_names:
+                if c not in f:
+                    f[c] = 0
+
+            X = pd.DataFrame([f])[self.feature_names].fillna(0)
+            proba = self.model.predict_proba(X)[0]
+            pred = int(np.argmax(proba))
+            conf = float(proba[pred])
+
+            classes = self.model.classes_
+            proba_dict = {int(c): float(p) for c, p in zip(classes, proba)}
+
+            return {
+                'signal': ['skip', 'long', 'short'][pred] if pred < 3 else 'skip',
+                'confidence': conf,
+                'proba': {
+                    'skip': proba_dict.get(0, 0),
+                    'long': proba_dict.get(1, 0),
+                    'short': proba_dict.get(2, 0)
+                }
+            }
+        except Exception as e:
+            log.error(f"Predict алдаа: {e}")
+            return None
+
+    def load(self):
+        try:
+            import joblib
+            if Path('ai_model.pkl').exists():
+                data = joblib.load('ai_model.pkl')
+                self.model = data['model']
+                self.feature_names = data['features']
+                self.is_trained = True
+                log.info("✅ AI model ачаалагдлаа")
+                return True
+        except Exception as e:
+            log.error(f"Model ачаалахад алдаа: {e}")
+        return False
+
+    def record_result(self, predicted_class, actual_class):
+        self.total_predictions += 1
+        if predicted_class == actual_class:
+            self.correct_predictions += 1
+            self.recent_accuracy.append(1)
+        else:
+            self.recent_accuracy.append(0)
+
+    def get_recent_accuracy(self):
+        return sum(self.recent_accuracy) / len(self.recent_accuracy) if self.recent_accuracy else 0
+
+
+AI = AIStrategy()
+
+# ════════════════════════════════════════════════════════════════
+# 5.5 CLAUDE AI — Дохиог баталгаажуулах
+# ════════════════════════════════════════════════════════════════
+def claude_confirm_signal(symbol, sig, features_summary):
+    cfg = STATE.config
+    if not cfg.get('USE_CLAUDE') or not cfg.get('CLAUDE_API_KEY'):
+        return True
+
+    try:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=cfg['CLAUDE_API_KEY'])
+
+        prompt = f"""Чи бол мэргэжлийн crypto scalp trader. Дараах мэдээллийг шинжилж,
+энэ арилжаа хийх нь зөв эсэхийг шийднэ үү.
+
+Хослол: {symbol}
+ML дохио: {sig['side'].upper()} (итгэлцэл: {sig['confidence']*100:.0f}%)
+Entry: {sig['entry']:.4f} | SL: {sig['sl']:.4f} | TP: {sig['tp']:.4f}
+
+Техникийн индикаторууд:
+{features_summary}
+
+Энэ scalp арилжаа эрсдэл багатай, ашигтай байх магадлал өндөр үү?
+ЗӨВХӨН JSON хэлбэрээр хариул: {{"approve": true/false, "reason": "товч тайлбар"}}"""
+
+        resp = client.messages.create(
+            model=cfg.get('CLAUDE_MODEL', 'claude-opus-4-20250514'),
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = resp.content[0].text.strip()
+
+        start = text.find('{')
+        end = text.rfind('}') + 1
+        if start >= 0 and end > start:
+            result = json.loads(text[start:end])
+            approved = bool(result.get('approve', False))
+            reason = result.get('reason', '')
+            STATE.add_log('INFO',
+                f"🤖 Claude: {'✅ ЗӨВШӨӨРЛӨӨ' if approved else '❌ ТАТГАЛЗЛАА'} — {reason}")
+            return approved
+        return False
+    except Exception as e:
+        STATE.add_log('WARNING', f"Claude алдаа: {e} — ML дохиог ашиглана")
+        return True
+
+
+def build_features_summary(symbol):
+    try:
+        df_15m = fetch_ohlcv(symbol, '15m', 100)
+        df_1h = fetch_ohlcv(symbol, '1h', 100)
+        if df_15m is None:
+            return "Мэдээлэл байхгүй"
+        fe = FeatureEngineer()
+        f = fe.build_features(df_15m, df_1h, None)
+        return (f"RSI: {f.get('rsi', 0):.1f}\n"
+                f"ADX (trend): {f.get('adx', 0):.1f}\n"
+                f"MACD hist: {f.get('macd_hist', 0):.5f}\n"
+                f"BB position: {f.get('bb_position', 0):.2f}\n"
+                f"Volume ratio: {f.get('vol_ratio', 0):.2f}\n"
+                f"1h trend (EMA): {f.get('1h_ema_diff', 0):.5f}\n"
+                f"ATR %: {f.get('atr_pct', 0)*100:.2f}%\n"
+                f"Volatility: {f.get('volatility_20', 0):.5f}")
+    except Exception:
+        return "Мэдээлэл боловсруулахад алдаа"
+
+# ════════════════════════════════════════════════════════════════
+# 6. БОТЫН ТӨЛӨВ
+# ════════════════════════════════════════════════════════════════
+class BotState:
+    def __init__(self):
+        self.config = CONFIG
+        self.exchange = None
+        self.lock = threading.RLock()
+        self.running = False
+        self.thread = None
+        self.trainer_thread = None
+        self.initial_balance = 0.0
+        self.peak_balance = 0.0
+        self.trades_today = 0
+        self.last_day_reset = date.today()
+        self.last_trade_close_time = 0
+        self.positions = {}
+        self.total_trades = 0
+        self.wins = 0
+        self.losses = 0
+        self.start_time = None
+        self.last_balance = 0.0
+        self.callbacks = []
+        self.trailing_threads = {}
+        self.daily_pnl = 0.0
+        self.consecutive_wins = 0
+        self.consecutive_losses = 0
+        self.last_train = None
+        self.equity_history = []
+
+    def emit(self, et, data):
+        for cb in self.callbacks:
+            try:
+                cb({'type': et, 'data': data})
+            except Exception as e:
+                log.warning(f"Emit алдаа: {e}")
+
+    def add_log(self, level, msg):
+        db_add_log(level, msg)
+        log.log(getattr(logging, level, logging.INFO), msg)
+        self.emit('log', {
+            'level': level, 'msg': msg,
+            'ts': datetime.now().isoformat()
+        })
+
+
+STATE = BotState()
+
+def send_telegram(msg):
+    if STATE.config.get('TELEGRAM_TOKEN') and STATE.config.get('CHAT_ID'):
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{STATE.config['TELEGRAM_TOKEN']}/sendMessage",
+                json={'chat_id': STATE.config['CHAT_ID'],
+                      'text': msg, 'parse_mode': 'HTML'},
+                timeout=5
+            )
+        except Exception:
+            pass
+
+# ════════════════════════════════════════════════════════════════
+# 7. EXCHANGE БОЛОН МЭДЭЭЛЭЛ ТАТАХ
+# ════════════════════════════════════════════════════════════════
+def init_exchange():
+    cfg = STATE.config
+    params = {
+        'apiKey': cfg.get('API_KEY', ''),
+        'secret': cfg.get('API_SECRET', ''),
+        'options': {'defaultType': 'future'},
+        'enableRateLimit': True
+    }
+    if cfg.get('TESTNET'):
+        params['urls'] = {
+            'api': {
+                'public': 'https://testnet.binancefuture.com/fapi/v1',
+                'private': 'https://testnet.binancefuture.com/fapi/v1'
+            }
+        }
+    STATE.exchange = ccxt.binance(params)
+
+def get_balance():
+    try:
+        return float(STATE.exchange.fetch_balance()['USDT']['free'])
+    except Exception as e:
+        log.error(f"get_balance: {e}")
+        return None
+
+def fetch_ohlcv(symbol, tf='15m', limit=100):
+    try:
+        bars = STATE.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+        if not bars:
+            return None
+        return pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+    except Exception as e:
+        log.warning(f"fetch_ohlcv({symbol}, {tf}): {e}")
+        return None
+
+def get_ai_signal(symbol):
+    if not AI.is_trained:
+        return None
+    df_15m = fetch_ohlcv(symbol, '15m', 100)
+    df_1h = fetch_ohlcv(symbol, '1h', 100)
+    df_4h = fetch_ohlcv(symbol, '4h', 50)
+    if df_15m is None or len(df_15m) < 60:
+        return None
+
+    pred = AI.predict(df_15m, df_1h, df_4h)
+    if pred is None or pred['signal'] == 'skip':
+        return None
+
+    if pred['confidence'] < STATE.config.get('AI_CONFIDENCE_THRESHOLD', 0.62):
+        return None
+
+    try:
+        import pandas_ta as ta
+        atr = ta.atr(df_15m['h'], df_15m['l'], df_15m['c'], length=14).iloc[-1]
+        if pd.isna(atr) or atr <= 0:
+            return None
+    except Exception:
+        return None
+
+    entry = df_15m['c'].iloc[-1]
+    side = 'buy' if pred['signal'] == 'long' else 'sell'
+
+    if STATE.config.get('SCALP_MODE'):
+        sl_mult = 0.8
+        tp_mult = 1.2
+    else:
+        sl_mult = 1.2
+        tp_mult = 2.4
+
+    if side == 'buy':
+        sl = entry - atr * sl_mult
+        tp = entry + atr * tp_mult
+    else:
+        sl = entry + atr * sl_mult
+        tp = entry - atr * tp_mult
+
+    return {
+        'symbol': symbol, 'side': side,
+        'strategy': f"ai_{pred['signal']}",
+        'score': int(pred['confidence'] * 100),
+        'entry': entry, 'sl': sl, 'tp': tp,
+        'confidence': pred['confidence'],
+        'proba': pred['proba']
+    }
+
+def calc_qty(symbol, entry, sl, balance, leverage):
+    try:
+        max_use = STATE.config.get('MAX_BALANCE_USE', 50)
+        usable_balance = min(balance, max_use)
+
+        market = STATE.exchange.market(symbol)
+        step = market['precision']['amount'] or 0.001
+        min_qty = market['limits']['amount']['min'] or step
+        rpc = abs(entry - sl)
+        if rpc <= 0:
+            return None
+        risk_amount = usable_balance * STATE.config.get('MAX_RISK_PER_TRADE', 0.015)
+        qty = risk_amount / rpc
+
+        max_notional = usable_balance * leverage
+        if qty * entry > max_notional:
+            qty = max_notional / entry
+
+        qty = max(min_qty, (qty // step) * step)
+        return round(qty, 8) if qty >= min_qty else None
+    except Exception as e:
+        log.error(f"calc_qty: {e}")
+        return None
+
+# ════════════════════════════════════════════════════════════════
+# 8. АРИЛЖАА ХИЙХ, ХААХ
+# ════════════════════════════════════════════════════════════════
+def close_position(symbol, reason='manual'):
+    if symbol not in STATE.positions:
+        return 0.0
+    pos = STATE.positions[symbol]
+    try:
+        positions = STATE.exchange.fetch_positions([symbol])
+        amt = 0.0
+        for p in positions:
+            amt = float(p['info'].get('positionAmt', 0))
+            if amt != 0:
+                break
+        if amt != 0:
+            side = 'sell' if amt > 0 else 'buy'
+            STATE.exchange.create_market_order(
+                symbol, side, abs(amt),
+                params={'reduceOnly': True}
+            )
+        for _ in range(10):
+            time.sleep(1)
+            positions = STATE.exchange.fetch_positions([symbol])
+            amt = sum(abs(float(p['info'].get('positionAmt', 0))) for p in positions)
+            if amt == 0:
+                break
+    except Exception as e:
+        log.error(f"close: {e}")
+        return 0.0
+
+    new_bal = get_balance() or 0
+    pnl = new_bal - pos['balance_before']
+    pnl_pct = (pnl / pos['balance_before'] * 100) if pos['balance_before'] else 0
+
+    db_close_trade(pos['trade_id'], pos['entry'], pnl, pnl_pct, reason)
+
+    if pnl > 0:
+        STATE.wins += 1
+        STATE.consecutive_wins += 1
+        STATE.consecutive_losses = 0
+    elif pnl < 0:
+        STATE.losses += 1
+        STATE.consecutive_losses += 1
+        STATE.consecutive_wins = 0
+
+    actual = 1 if pnl > 0 else 2 if pnl < 0 else 0
+    if pos.get('predicted_class') is not None:
+        AI.record_result(pos['predicted_class'], actual)
+
+    STATE.daily_pnl += pnl
+    STATE.last_trade_close_time = time.time()
+    STATE.positions.pop(symbol, None)
+    STATE.emit('position_closed', {
+        'symbol': symbol, 'pnl': pnl, 'reason': reason
+    })
+
+    emoji = '✅' if pnl > 0 else '❌'
+    STATE.add_log('INFO', f"{emoji} {symbol} {reason}: ${pnl:+.3f}")
+    send_telegram(f"{emoji} {symbol.split(':')[0]} PnL: ${pnl:+.3f}\n📝 {reason}")
+    return pnl
+
+def execute_trade(sig):
+    cfg = STATE.config
+    symbol = sig['symbol']
+    bal = get_balance()
+    if not bal or bal < cfg.get('MIN_BALANCE', 15):
+        STATE.add_log('WARNING', f"Баланс {cfg.get('MIN_BALANCE',15)}$-аас бага: ${bal}")
+        return False
+
+    if cfg.get('USE_CLAUDE'):
+        summary = build_features_summary(symbol)
+        if not claude_confirm_signal(symbol, sig, summary):
+            STATE.add_log('INFO', f"⏭️ {symbol}: Claude татгалзсан тул алгассан")
+            return False
+
+    lev = cfg.get('LEVERAGE', 5)
+    lev += min(2, STATE.consecutive_wins // 3)
+    lev -= min(2, STATE.consecutive_losses // 2)
+    lev = max(3, min(7, lev))
+
+    try:
+        STATE.exchange.set_leverage(lev, symbol)
+    except Exception:
+        pass
+
+    qty = calc_qty(symbol, sig['entry'], sig['sl'], bal, lev)
+    if not qty:
+        STATE.add_log('WARNING', f"qty тооцож чадсангүй: {symbol}")
+        return False
+
+    try:
+        STATE.exchange.create_market_order(symbol, sig['side'], qty)
+    except Exception as e:
+        STATE.add_log('ERROR', f"Order алдаа: {e}")
+        return False
+
+    close_side = 'sell' if sig['side'] == 'buy' else 'buy'
+    try:
+        STATE.exchange.create_order(
+            symbol, 'STOP_MARKET', close_side, qty,
+            params={'stopPrice': sig['sl'], 'reduceOnly': True,
+                    'workingType': 'MARK_PRICE'}
+        )
+        STATE.exchange.create_order(
+            symbol, 'TAKE_PROFIT_MARKET', close_side, qty,
+            params={'stopPrice': sig['tp'], 'reduceOnly': True,
+                    'workingType': 'MARK_PRICE'}
+        )
+    except Exception as e:
+        STATE.add_log('ERROR', f"SL/TP алдаа: {e}")
+
+    pred_class = 1 if sig['side'] == 'buy' else 2
+    trade_id = db_add_trade(
+        symbol, sig['side'], sig['strategy'], sig['entry'],
+        sig['sl'], sig['tp'], qty, sig['score'], lev
+    )
+    db_add_prediction(symbol, sig['side'], sig['confidence'], sig.get('expected_return', 0))
+
+    STATE.positions[symbol] = {
+        'side': sig['side'], 'qty': qty, 'entry': sig['entry'],
+        'sl': sig['sl'], 'tp': sig['tp'], 'trade_id': trade_id,
+        'strategy': sig['strategy'], 'score': sig['score'],
+        'confidence': sig['confidence'], 'predicted_class': pred_class,
+        'balance_before': bal, 'leverage': lev,
+        'opened_at': datetime.now().isoformat()
+    }
+    STATE.trades_today += 1
+    STATE.total_trades += 1
+    STATE.emit('position_opened', STATE.positions[symbol])
+
+    side_lbl = '🟢 LONG' if sig['side'] == 'buy' else '🔴 SHORT'
+    msg = (f"{side_lbl} <b>{symbol.split(':')[0]}</b>\n"
+           f"🧠 AI: {sig['confidence']*100:.0f}%\n⚡ Lev: {lev}x\n"
+           f"💰 {qty}\n📍 {sig['entry']:.4f}\n"
+           f"🛑 {sig['sl']:.4f}\n🎯 {sig['tp']:.4f}")
+    send_telegram(msg)
+    STATE.add_log('INFO', f"{side_lbl} {symbol} @ {sig['entry']:.4f}")
+    return True
+
+# ════════════════════════════════════════════════════════════════
+# 9. TRAILING STOP
+# ════════════════════════════════════════════════════════════════
+def run_trailing(symbol):
+    if not STATE.config.get('USE_TRAILING'):
+        return
+    pos = STATE.positions.get(symbol)
+    if not pos:
+        return
+    cfg = STATE.config
+    triggered = False
+    stop = pos['entry'] * (0.992 if pos['side'] == 'buy' else 1.008)
+
+    while symbol in STATE.positions and STATE.running:
+        try:
+            cur = STATE.exchange.fetch_ticker(symbol)['last']
+            if pos['side'] == 'buy':
+                if not triggered and cur >= pos['entry'] * (1 + cfg['TRAILING_TRIGGER']):
+                    triggered = True
+                    stop = cur * (1 - cfg['TRAILING_DISTANCE'])
+                if triggered:
+                    stop = max(stop, cur * (1 - cfg['TRAILING_DISTANCE']))
+                    if cur <= stop:
+                        close_position(symbol, 'trailing')
+                        break
+            else:
+                if not triggered and cur <= pos['entry'] * (1 - cfg['TRAILING_TRIGGER']):
+                    triggered = True
+                    stop = cur * (1 + cfg['TRAILING_DISTANCE'])
+                if triggered:
+                    stop = min(stop, cur * (1 + cfg['TRAILING_DISTANCE']))
+                    if cur >= stop:
+                        close_position(symbol, 'trailing')
+                        break
+        except Exception:
+            pass
+        time.sleep(2)
+
+# ════════════════════════════════════════════════════════════════
+# 10. AUTO-RETRAIN
+# ════════════════════════════════════════════════════════════════
+def trainer_loop():
+    interval = STATE.config.get('AI_RETRAIN_INTERVAL', 7200)
+    symbol = STATE.config['SYMBOLS'][0] if STATE.config.get('SYMBOLS') else 'BTC/USDT:USDT'
+    while STATE.running:
+        if STATE.last_train is None or \
+           (datetime.now() - STATE.last_train).total_seconds() >= interval:
+            try:
+                STATE.add_log('INFO', f"🔄 Auto-retrain эхлэв ({symbol})")
+                if AI.train(symbol, days=14):
+                    STATE.last_train = datetime.now()
+                    STATE.emit('ai_trained', {'accuracy': AI.accuracy})
+            except Exception as e:
+                STATE.add_log('ERROR', f"Auto-retrain: {e}")
+        time.sleep(60)
+
+# ════════════════════════════════════════════════════════════════
+# 11. БОТЫН ҮНДСЭН ДОХИОЛТ
+# ════════════════════════════════════════════════════════════════
+def bot_loop():
+    cfg = STATE.config
+    STATE.start_time = datetime.now()
+
+    if not AI.is_trained:
+        if not AI.load():
+            STATE.add_log('INFO', '🧠 AI model байхгүй. Сургаж байна... (5-10 мин)')
+            sym = cfg['SYMBOLS'][0] if cfg.get('SYMBOLS') else 'BTC/USDT:USDT'
+            if not AI.train(sym, days=30):
+                STATE.add_log('ERROR', '❌ AI сургалт амжилтгүй.')
+                STATE.running = False
+                return
+        STATE.last_train = datetime.now()
+
+    if STATE.trainer_thread is None or not STATE.trainer_thread.is_alive():
+        STATE.trainer_thread = threading.Thread(target=trainer_loop, daemon=True)
+        STATE.trainer_thread.start()
+
+    try:
+        init_exchange()
+    except Exception as e:
+        STATE.add_log('ERROR', f"Exchange холболт: {e}")
+        STATE.running = False
+        return
+
+    bal = get_balance()
+    if not bal:
+        STATE.add_log('ERROR', "Баланс авах боломжгүй — API key шалгана уу")
+        STATE.running = False
+        return
+
+    STATE.initial_balance = bal
+    STATE.peak_balance = bal
+    STATE.last_balance = bal
+    claude_status = "🤖 Claude: ON" if cfg.get('USE_CLAUDE') else "🤖 Claude: OFF"
+    send_telegram(
+        f"🧠💰 AI Bot эхэллээ\n"
+        f"💵 ${bal:.2f}\n"
+        f"📊 Accuracy: {AI.get_recent_accuracy()*100:.1f}%\n"
+        f"{claude_status}"
+    )
+    STATE.add_log('INFO', f"🧠 Bot аслаа. ${bal:.2f} | {claude_status}")
+
+    last_emit = 0
+    while STATE.running:
+        try:
+            if date.today() != STATE.last_day_reset:
+                STATE.trades_today = 0
+                STATE.last_day_reset = date.today()
+                STATE.daily_pnl = 0
+
+            cur_bal = get_balance() or 0
+            if cur_bal > 0:
+                if STATE.daily_pnl >= cur_bal * cfg['DAILY_PROFIT_TARGET']:
+                    STATE.add_log('INFO', f"🎯 Daily profit target хүрлээ")
+                    send_telegram("🎯 Өдрийн profit target! Зогсож байна")
+                    STATE.running = False
+                    break
+                if STATE.daily_pnl <= -cur_bal * cfg['DAILY_LOSS_LIMIT']:
+                    STATE.add_log('WARNING', f"🛑 Daily loss limit хүрлээ")
+                    send_telegram("🛑 Өдрийн loss limit! Зогсож байна")
+                    STATE.running = False
+                    break
+
+            for sym in list(STATE.positions.keys()):
+                t = STATE.trailing_threads.get(sym)
+                if not t or not t.is_alive():
+                    STATE.trailing_threads[sym] = threading.Thread(
+                        target=run_trailing, args=(sym,), daemon=True
+                    )
+                    STATE.trailing_threads[sym].start()
+
+            for sym in list(STATE.positions.keys()):
+                try:
+                    positions = STATE.exchange.fetch_positions([sym])
+                    amt = sum(abs(float(p['info'].get('positionAmt', 0))) for p in positions)
+                    if amt == 0:
+                        close_position(sym, 'sl_or_tp')
+                except Exception:
+                    pass
+
+            if (len(STATE.positions) < cfg['MAX_POSITIONS'] and
+                STATE.trades_today < cfg['MAX_TRADES_PER_DAY'] and
+                time.time() - STATE.last_trade_close_time >= cfg['GLOBAL_COOLDOWN']):
+
+                best_sig = None
+                for sym in cfg.get('SYMBOLS', []):
+                    if sym in STATE.positions:
+                        continue
+                    sig = get_ai_signal(sym)
+                    if sig and (not best_sig or sig['confidence'] > best_sig['confidence']):
+                        best_sig = sig
+
+                if best_sig:
+                    execute_trade(best_sig)
+
+            now = time.time()
+            if now - last_emit >= 2:
+                STATE.emit('tick', get_snapshot())
+                last_emit = now
+
+            time.sleep(2)
+        except Exception as e:
+            STATE.add_log('ERROR', f"Loop алдаа: {e}")
+            time.sleep(5)
+
+    STATE.add_log('WARNING', '⏹️ Bot зогслоо')
+    send_telegram("⏹️ Bot зогслоо")
+
+def start_bot():
+    if STATE.running:
+        return False, "Аль хэдийн ажиллаж байна"
+    if not STATE.config.get('API_KEY') and not STATE.config.get('TESTNET'):
+        return False, "API түлхүүр оруулаагүй байна"
+    STATE.running = True
+    STATE.thread = threading.Thread(target=bot_loop, daemon=True)
+    STATE.thread.start()
+    return True, "🧠 Bot эхэллээ"
+
+def stop_bot():
+    STATE.running = False
+    return True, "Зогсох хүсэлт илгээгдлээ"
+
+def close_all():
+    return [{'symbol': s, 'pnl': close_position(s, 'all')}
+            for s in list(STATE.positions.keys())]
+
+def get_snapshot():
+    bal = get_balance() or 0
+    return {
+        'running': STATE.running,
+        'balance': bal,
+        'initial_balance': STATE.initial_balance,
+        'peak_balance': STATE.peak_balance,
+        'total_pnl': bal - STATE.initial_balance,
+        'total_pnl_pct': (bal - STATE.initial_balance) / STATE.initial_balance * 100
+                         if STATE.initial_balance else 0,
+        'trades_today': STATE.trades_today,
+        'total_trades': STATE.total_trades,
+        'wins': STATE.wins,
+        'losses': STATE.losses,
+        'winrate': (STATE.wins / STATE.total_trades * 100) if STATE.total_trades else 0,
+        'ai_accuracy': AI.get_recent_accuracy(),
+        'ai_total_preds': AI.total_predictions,
+        'positions': {s: {k: v for k, v in p.items() if k != 'balance_before'}
+                      for s, p in STATE.positions.items()},
+        'uptime': str(datetime.now() - STATE.start_time) if STATE.start_time else '0:00:00',
+        'daily_pnl': STATE.daily_pnl,
+        'daily_pnl_pct': (STATE.daily_pnl / STATE.initial_balance * 100)
+                         if STATE.initial_balance else 0,
+        'consecutive_wins': STATE.consecutive_wins,
+        'consecutive_losses': STATE.consecutive_losses,
+        'last_train': STATE.last_train.isoformat() if STATE.last_train else None,
+        'use_claude': STATE.config.get('USE_CLAUDE', False)
+    }
+
+# ════════════════════════════════════════════════════════════════
+# 12. FLASK ВЭБ СЕРВЕР
+# ════════════════════════════════════════════════════════════════
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'mnbot-2024-secret'
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+
+def push_event(event):
+    try:
+        socketio.emit('update', event)
+    except Exception as e:
+        log.warning(f"Socket emit: {e}")
+
+STATE.callbacks.append(push_event)
+
+# ════════════════════════════════════════════════════════════════
+# 13. HTML TEMPLATE
+# ════════════════════════════════════════════════════════════════
+HTML_TEMPLATE = '''<!DOCTYPE html>
+<html lang="mn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🤖 AI Trading Bot</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<style>
+* { box-sizing: border-box; }
+body {
+  background: linear-gradient(135deg, #0a0e1a 0%, #0d1424 100%);
+  color: #e2e8f0; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+  min-height: 100vh; margin: 0;
+}
+.card {
+  background: rgba(19, 24, 38, 0.7);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(31, 41, 55, 0.8);
+  border-radius: 16px; padding: 20px; transition: all 0.3s;
+}
+.card:hover { border-color: rgba(59, 130, 246, 0.3); }
+.stat-val { font-size: 1.5rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.green { color: #10b981; } .red { color: #ef4444; } .yellow { color: #f59e0b; }
+.purple { color: #a78bfa; } .gray { color: #9ca3af; }
+.btn {
+  padding: 8px 16px; border-radius: 10px; font-weight: 600;
+  cursor: pointer; border: none; transition: all 0.2s;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.btn:hover { transform: translateY(-1px); }
+.btn-primary { background: #2563eb; color: white; }
+.btn-primary:hover { background: #1d4ed8; }
+.btn-warn { background: #d97706; color: white; }
+.btn-danger { background: #dc2626; color: white; }
+.btn-success { background: #16a34a; color: white; }
+input, select {
+  background: rgba(10, 14, 26, 0.8);
+  border: 1px solid #374151; color: #e2e8f0;
+  border-radius: 8px; padding: 8px 12px; width: 100%; transition: all 0.2s;
+}
+input:focus, select:focus { outline: none; border-color: #3b82f6; }
+.pulse-dot { animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+.status-running {
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.3); color: #10b981;
+}
+.status-stopped {
+  background: rgba(107, 114, 128, 0.15);
+  border: 1px solid rgba(107, 114, 128, 0.3); color: #9ca3af;
+}
+.claude-badge {
+  background: rgba(167, 139, 250, 0.15);
+  border: 1px solid rgba(167, 139, 250, 0.4); color: #a78bfa;
+  padding: 4px 10px; border-radius: 20px; font-size: 0.75rem;
+}
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: #0a0e1a; }
+::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
+</style>
+</head>
+<body class="p-4">
+
+{% if not logged_in %}
+<div class="min-h-screen flex items-center justify-center">
+  <div class="card w-full max-w-md">
+    <div class="text-center mb-6">
+      <div class="text-5xl mb-3">🤖</div>
+      <h1 class="text-2xl font-bold mb-1">AI Trading Bot</h1>
+      <p class="text-gray-400 text-sm">Binance Futures · Scalp · Claude AI</p>
+    </div>
+    {% if error %}<div class="bg-red-900/30 border border-red-700 text-red-300 p-3 rounded-lg mb-4 text-sm">⚠️ {{ error }}</div>{% endif %}
+    <form method="POST" class="space-y-4">
+      <input type="text" name="username" placeholder="👤 Хэрэглэгч" required>
+      <input type="password" name="password" placeholder="🔒 Нууц үг" required>
+      <button type="submit" class="btn btn-primary w-full justify-center">🔐 Нэвтрэх</button>
+    </form>
+    <p class="text-xs text-gray-500 text-center mt-4">Default: <code class="text-gray-400">admin / admin123</code></p>
+  </div>
+</div>
+
+{% else %}
+<div class="max-w-7xl mx-auto">
+  <div class="flex flex-wrap items-center justify-between mb-6 gap-3">
+    <div>
+      <h1 class="text-2xl font-bold flex items-center gap-2">
+        <span class="text-3xl">🤖</span> AI Trading Bot
+        <span class="claude-badge" id="claude-badge">🤖 Claude: OFF</span>
+      </h1>
+      <p class="text-gray-400 text-sm mt-1" id="uptime">⏱️ Uptime: --</p>
+    </div>
+    <div class="flex items-center gap-2 flex-wrap">
+      <span id="bot-status" class="px-3 py-1.5 rounded-full text-sm font-semibold status-stopped">⏸️ Зогссон</span>
+      <button onclick="startBot()" class="btn btn-success">▶ Асаах</button>
+      <button onclick="stopBot()" class="btn btn-warn">⏸ Зогсоох</button>
+      <button onclick="closeAll()" class="btn btn-danger">🛑 Бүгдийг хаах</button>
+      <a href="/logout" class="btn btn-warn">🚪 Гарах</a>
+    </div>
+  </div>
+
+  <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
+    <div class="card">
+      <div class="text-gray-400 text-xs mb-1">💰 Баланс</div>
+      <div class="stat-val" id="balance">$0.00</div>
+      <div class="text-xs gray mt-1" id="total-pnl-pct">0.00%</div>
+    </div>
+    <div class="card">
+      <div class="text-gray-400 text-xs mb-1">📈 Өнөөдрийн PnL</div>
+      <div class="stat-val" id="pnl">$0.00</div>
+      <div class="text-xs gray mt-1" id="pnl-pct">0.00%</div>
+    </div>
+    <div class="card">
+      <div class="text-gray-400 text-xs mb-1">🎯 Win Rate</div>
+      <div class="stat-val" id="winrate">0%</div>
+      <div class="text-xs gray mt-1" id="wl-count">0W · 0L</div>
+    </div>
+    <div class="card">
+      <div class="text-gray-400 text-xs mb-1">🧠 AI Accuracy</div>
+      <div class="stat-val purple" id="ai-acc">0%</div>
+      <div class="text-xs gray mt-1" id="ai-preds">0 predictions</div>
+    </div>
+    <div class="card">
+      <div class="text-gray-400 text-xs mb-1">🔢 Арилжаа</div>
+      <div class="stat-val"><span id="trades-today">0</span>/<span id="total-trades" class="text-base text-gray-400">0</span></div>
+      <div class="text-xs gray mt-1">өнөөдөр / нийт</div>
+    </div>
+    <div class="card">
+      <div class="text-gray-400 text-xs mb-1">🔥 Streak</div>
+      <div class="stat-val green" id="streak">-</div>
+      <div class="text-xs gray mt-1" id="streak-info">-</div>
+    </div>
+  </div>
+
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+    <div class="lg:col-span-2 space-y-4">
+      <div class="card">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="font-bold">📈 Equity Curve</h2>
+          <span class="text-xs gray">Live · 60 ticks</span>
+        </div>
+        <canvas id="equityChart" height="100"></canvas>
+      </div>
+
+      <div class="card">
+        <h2 class="font-bold mb-3 flex items-center justify-between">
+          <span>📍 Нээлттэй позиц</span>
+          <span class="text-sm text-gray-400" id="pos-count">(0)</span>
+        </h2>
+        <div id="positions">
+          <p class="text-gray-500 text-sm text-center py-4">Позиц байхгүй</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 class="font-bold mb-3">📜 Сүүлийн арилжаанууд</h2>
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead class="text-gray-400 text-left">
+              <tr class="border-b border-gray-700">
+                <th class="py-2">Огноо</th><th>Хослол</th><th>Тал</th>
+                <th>Lev</th><th>AI</th><th>PnL</th><th>Статус</th>
+              </tr>
+            </thead>
+            <tbody id="trades-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="space-y-4">
+      <div class="card">
+        <h2 class="font-bold mb-3">⚙️ Тохиргоо</h2>
+        <div class="space-y-3 text-sm">
+          <label class="block">
+            <span class="text-gray-400 text-xs">🔑 API Key</span>
+            <input id="cfg-key" type="password" placeholder="(хоосон бол хадгалсан хэвээр)">
+          </label>
+          <label class="block">
+            <span class="text-gray-400 text-xs">🔐 API Secret</span>
+            <input id="cfg-secret" type="password" placeholder="(хоосон бол хадгалсан хэвээр)">
+          </label>
+          <div class="grid grid-cols-2 gap-2">
+            <label><span class="text-gray-400 text-xs">⚡ Хөшүүрэг</span><input id="cfg-lev" type="number"></label>
+            <label><span class="text-gray-400 text-xs">💸 Эрсдэл %</span><input id="cfg-risk" type="number" step="0.001"></label>
+            <label><span class="text-gray-400 text-xs">🎯 Profit %</span><input id="cfg-pt" type="number" step="0.01"></label>
+            <label><span class="text-gray-400 text-xs">🛑 Loss %</span><input id="cfg-ll" type="number" step="0.01"></label>
+            <label><span class="text-gray-400 text-xs">📉 Доод $</span><input id="cfg-minbal" type="number"></label>
+            <label><span class="text-gray-400 text-xs">📈 Дээд $</span><input id="cfg-maxbal" type="number"></label>
+          </div>
+          <label class="block">
+            <span class="text-gray-400 text-xs">📊 Хослолууд (таслалаар)</span>
+            <input id="cfg-syms" type="text">
+          </label>
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input id="cfg-scalp" type="checkbox" class="w-auto">
+            <span class="text-xs">⚡ Scalp горим (бага эрсдэл)</span>
+          </label>
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input id="cfg-testnet" type="checkbox" class="w-auto">
+            <span class="text-xs">🧪 Testnet ашиглах</span>
+          </label>
+          <hr class="border-gray-700">
+          <div class="text-xs purple font-bold">🤖 Claude AI баталгаажуулалт</div>
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input id="cfg-useclaude" type="checkbox" class="w-auto">
+            <span class="text-xs">Claude-аар дохио шалгуулах</span>
+          </label>
+          <label class="block">
+            <span class="text-gray-400 text-xs">🔑 Claude API Key</span>
+            <input id="cfg-claudekey" type="password" placeholder="sk-ant-... (хоосон бол хэвээр)">
+          </label>
+          <label class="block">
+            <span class="text-gray-400 text-xs">🧬 Claude Model</span>
+            <input id="cfg-claudemodel" type="text" placeholder="claude-opus-4-20250514">
+          </label>
+          <hr class="border-gray-700">
+          <label class="block">
+            <span class="text-gray-400 text-xs">📨 Telegram Token</span>
+            <input id="cfg-tg" type="text">
+          </label>
+          <label class="block">
+            <span class="text-gray-400 text-xs">💬 Telegram Chat ID</span>
+            <input id="cfg-tgc" type="text">
+          </label>
+          <div class="flex gap-2 pt-2">
+            <button onclick="saveConfig()" class="btn btn-primary flex-1 justify-center">💾 Хадгалах</button>
+            <button onclick="testTg()" class="btn btn-warn">📨</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 class="font-bold mb-3">🧠 AI Model</h2>
+        <button onclick="trainAI()" class="btn btn-primary w-full justify-center mb-3">📚 Model сургах</button>
+        <div class="space-y-1 text-xs text-gray-400">
+          <div class="flex justify-between"><span>Accuracy:</span><b class="purple" id="ai-acc-2">-</b></div>
+          <div class="flex justify-between"><span>Predictions:</span><b id="ai-preds-2">-</b></div>
+          <div class="flex justify-between"><span>Last train:</span><b id="ai-last">-</b></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 class="font-bold mb-3">📋 Логууд</h2>
+        <div id="logs" class="h-48 overflow-y-auto bg-black/40 rounded-lg p-2 text-xs font-mono"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const socket = io();
+let equityChart;
+let lastBal = 0;
+
+const fmt = (n, d=2) => Number(n||0).toFixed(d);
+const sign = n => n >= 0 ? 'green' : 'red';
+const timeAgo = (iso) => {
+  if (!iso) return 'Ачаалагдаагүй';
+  const d = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (d < 60) return Math.floor(d) + 's ago';
+  if (d < 3600) return Math.floor(d/60) + 'm ago';
+  if (d < 86400) return Math.floor(d/3600) + 'h ago';
+  return Math.floor(d/86400) + 'd ago';
+};
+
+function initChart() {
+  const ctx = document.getElementById('equityChart').getContext('2d');
+  equityChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [{
+      label: 'Equity ($)', data: [],
+      borderColor: '#10b981', backgroundColor: 'rgba(16, 185, 129, 0.1)',
+      tension: 0.4, fill: true, pointRadius: 0
+    }]},
+    options: {
+      responsive: true, animation: { duration: 300 },
+      plugins: { legend: { display: false } },
+      scales: {
+        y: { grid: { color: 'rgba(31, 41, 55, 0.5)' }, ticks: { color: '#9ca3af' } },
+        x: { grid: { display: false }, ticks: { color: '#9ca3af', maxTicksLimit: 6 } }
+      }
+    }
+  });
+}
+
+function updateUI(s) {
+  const status = document.getElementById('bot-status');
+  if (s.running) {
+    status.innerHTML = '<span class="pulse-dot">🟢</span> Ажиллаж байна';
+    status.className = 'px-3 py-1.5 rounded-full text-sm font-semibold status-running';
+  } else {
+    status.textContent = '⏸️ Зогссон';
+    status.className = 'px-3 py-1.5 rounded-full text-sm font-semibold status-stopped';
+  }
+
+  const cb = document.getElementById('claude-badge');
+  cb.textContent = s.use_claude ? '🤖 Claude: ON' : '🤖 Claude: OFF';
+
+  document.getElementById('balance').textContent = '$' + fmt(s.balance);
+  const totalPct = document.getElementById('total-pnl-pct');
+  totalPct.textContent = fmt(s.total_pnl_pct) + '%';
+  totalPct.className = 'text-xs mt-1 ' + sign(s.total_pnl);
+
+  const pnlEl = document.getElementById('pnl');
+  pnlEl.textContent = '$' + fmt(s.daily_pnl);
+  pnlEl.className = 'stat-val ' + sign(s.daily_pnl);
+
+  document.getElementById('pnl-pct').textContent = fmt(s.daily_pnl_pct) + '%';
+  document.getElementById('winrate').textContent = fmt(s.winrate, 1) + '%';
+  document.getElementById('wl-count').textContent = s.wins + 'W · ' + s.losses + 'L';
+  document.getElementById('ai-acc').textContent = fmt(s.ai_accuracy * 100, 1) + '%';
+  document.getElementById('ai-preds').textContent = s.ai_total_preds + ' predictions';
+  document.getElementById('ai-acc-2').textContent = fmt(s.ai_accuracy * 100, 1) + '%';
+  document.getElementById('ai-preds-2').textContent = s.ai_total_preds;
+  document.getElementById('ai-last').textContent = timeAgo(s.last_train);
+  document.getElementById('trades-today').textContent = s.trades_today;
+  document.getElementById('total-trades').textContent = s.total_trades;
+  document.getElementById('uptime').textContent = '⏱️ Uptime: ' + s.uptime.split('.')[0];
+
+  const streakEl = document.getElementById('streak');
+  const streakInfo = document.getElementById('streak-info');
+  if (s.consecutive_wins > 0) {
+    streakEl.textContent = s.consecutive_wins + 'W';
+    streakEl.className = 'stat-val green';
+    streakInfo.textContent = '🔥 Ялалтын цуврал';
+  } else if (s.consecutive_losses > 0) {
+    streakEl.textContent = s.consecutive_losses + 'L';
+    streakEl.className = 'stat-val red';
+    streakInfo.textContent = '⚠️ Сэрэмжлүүлэг';
+  } else {
+    streakEl.textContent = '-';
+    streakEl.className = 'stat-val gray';
+    streakInfo.textContent = 'Төлөв тодорхойгүй';
+  }
+
+  const pos = Object.entries(s.positions || {});
+  document.getElementById('pos-count').textContent = '(' + pos.length + ')';
+  const posDiv = document.getElementById('positions');
+  if (pos.length === 0) {
+    posDiv.innerHTML = '<p class="text-gray-500 text-sm text-center py-4">📭 Позиц байхгүй</p>';
+  } else {
+    posDiv.innerHTML = pos.map(([sym, p]) => {
+      const sideColor = p.side === 'buy' ? 'green' : 'red';
+      const sideEmoji = p.side === 'buy' ? '🟢 LONG' : '🔴 SHORT';
+      return `<div class="border border-gray-700 rounded-xl p-3 mb-2">
+        <div class="flex justify-between items-center mb-2">
+          <span class="font-bold ${sideColor}">${sideEmoji} ${sym.split(':')[0]}</span>
+          <span class="text-xs px-2 py-0.5 rounded bg-gray-800">${p.strategy}</span>
+        </div>
+        <div class="grid grid-cols-2 gap-2 text-xs">
+          <div><span class="gray">📍 Entry:</span> <b>${fmt(p.entry, 4)}</b></div>
+          <div><span class="gray">⚡ Lev:</span> <b>${p.leverage}x</b></div>
+          <div><span class="gray">🛑 SL:</span> <b class="red">${fmt(p.sl, 4)}</b></div>
+          <div><span class="gray">🎯 TP:</span> <b class="green">${fmt(p.tp, 4)}</b></div>
+          <div><span class="gray">🧠 AI:</span> <b class="purple">${p.confidence ? (p.confidence*100).toFixed(0) : '-'}%</b></div>
+          <div><span class="gray">💰 Qty:</span> <b>${fmt(p.qty, 3)}</b></div>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  if (s.balance && Math.abs(s.balance - lastBal) > 0.001) {
+    lastBal = s.balance;
+    const now = new Date().toLocaleTimeString();
+    equityChart.data.labels.push(now);
+    equityChart.data.datasets[0].data.push(s.balance);
+    if (equityChart.data.labels.length > 60) {
+      equityChart.data.labels.shift();
+      equityChart.data.datasets[0].data.shift();
+    }
+    equityChart.update('none');
+  }
+}
+
+async function loadTrades() {
+  try {
+    const trades = await (await fetch('/api/trades')).json();
+    const body = document.getElementById('trades-body');
+    if (!trades || !trades.length) {
+      body.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-gray-500">Арилжаа байхгүй</td></tr>';
+      return;
+    }
+    body.innerHTML = trades.slice(0, 20).map(t => {
+      const pnlCls = t.pnl > 0 ? 'green' : t.pnl < 0 ? 'red' : 'gray';
+      const sideCls = t.side === 'buy' ? 'bg-green-900/50 text-green-300' : 'bg-red-900/50 text-red-300';
+      const statCls = t.status === 'open' ? 'bg-yellow-900/50 text-yellow-300' : 'bg-gray-700 text-gray-300';
+      return `<tr class="border-t border-gray-800 hover:bg-gray-800/30">
+        <td class="py-2 text-xs">${(t.opened_at || '').slice(5, 16)}</td>
+        <td class="text-xs">${t.symbol.split(':')[0]}</td>
+        <td><span class="px-2 py-0.5 rounded text-xs ${sideCls}">${t.side.toUpperCase()}</span></td>
+        <td class="text-xs">${t.leverage}x</td>
+        <td class="text-xs purple">${t.score}%</td>
+        <td class="${pnlCls} font-mono text-xs">${t.pnl >= 0 ? '+' : ''}${fmt(t.pnl)}</td>
+        <td><span class="px-2 py-0.5 rounded text-xs ${statCls}">${t.status === 'open' ? '🟢' : '⚪'} ${t.status}</span></td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    console.error('loadTrades:', e);
+  }
+}
+
+async function loadConfig() {
+  try {
+    const c = await (await fetch('/api/config')).json();
+    document.getElementById('cfg-lev').value = c.LEVERAGE;
+    document.getElementById('cfg-risk').value = c.MAX_RISK_PER_TRADE;
+    document.getElementById('cfg-pt').value = c.DAILY_PROFIT_TARGET;
+    document.getElementById('cfg-ll').value = c.DAILY_LOSS_LIMIT;
+    document.getElementById('cfg-minbal').value = c.MIN_BALANCE;
+    document.getElementById('cfg-maxbal').value = c.MAX_BALANCE_USE;
+    document.getElementById('cfg-syms').value = (c.SYMBOLS || []).join(',');
+    document.getElementById('cfg-scalp').checked = c.SCALP_MODE;
+    document.getElementById('cfg-testnet').checked = c.TESTNET;
+    document.getElementById('cfg-useclaude').checked = c.USE_CLAUDE;
+    document.getElementById('cfg-claudemodel').value = c.CLAUDE_MODEL || '';
+  } catch (e) { console.error('loadConfig:', e); }
+}
+
+async function saveConfig() {
+  const data = {
+    API_KEY: document.getElementById('cfg-key').value,
+    API_SECRET: document.getElementById('cfg-secret').value,
+    LEVERAGE: parseInt(document.getElementById('cfg-lev').value) || 5,
+    MAX_RISK_PER_TRADE: parseFloat(document.getElementById('cfg-risk').value) || 0.015,
+    DAILY_PROFIT_TARGET: parseFloat(document.getElementById('cfg-pt').value) || 0.03,
+    DAILY_LOSS_LIMIT: parseFloat(document.getElementById('cfg-ll').value) || 0.05,
+    MIN_BALANCE: parseInt(document.getElementById('cfg-minbal').value) || 15,
+    MAX_BALANCE_USE: parseInt(document.getElementById('cfg-maxbal').value) || 50,
+    SYMBOLS: document.getElementById('cfg-syms').value.split(',').map(s=>s.trim()).filter(Boolean),
+    SCALP_MODE: document.getElementById('cfg-scalp').checked,
+    TESTNET: document.getElementById('cfg-testnet').checked,
+    USE_CLAUDE: document.getElementById('cfg-useclaude').checked,
+    CLAUDE_API_KEY: document.getElementById('cfg-claudekey').value,
+    CLAUDE_MODEL: document.getElementById('cfg-claudemodel').value,
+    TELEGRAM_TOKEN: document.getElementById('cfg-tg').value,
+    CHAT_ID: document.getElementById('cfg-tgc').value,
+  };
+  try {
+    const r = await (await fetch('/api/config', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(data)
+    })).json();
+    alert(r.ok ? '✅ ' + r.msg : '❌ ' + (r.msg || 'Алдаа'));
+    document.getElementById('cfg-key').value = '';
+    document.getElementById('cfg-secret').value = '';
+    document.getElementById('cfg-claudekey').value = '';
+  } catch (e) { alert('❌ ' + e.message); }
+}
+
+async function testTg() {
+  try {
+    await fetch('/api/test_telegram', {method: 'POST'});
+    alert('📨 Тест илгээгдлээ. Telegram дээрээ шалгаарай.');
+  } catch (e) { alert('❌ ' + e.message); }
+}
+
+async function trainAI() {
+  if (!confirm('AI model дахин сургах уу? (5-10 минут)')) return;
+  try {
+    await fetch('/api/ai/train', {method: 'POST'});
+    alert('📚 Сургалт эхлэв. Лог хэсгээс явцыг хараарай.');
+  } catch (e) { alert('❌ ' + e.message); }
+}
+
+async function startBot() {
+  try {
+    const r = await (await fetch('/api/bot/start', {method: 'POST'})).json();
+    alert(r.ok ? '✅ ' + r.msg : '❌ ' + r.msg);
+  } catch (e) { alert('❌ ' + e.message); }
+}
+
+async function stopBot() {
+  if (!confirm('Бот зогсоох уу?')) return;
+  try {
+    const r = await (await fetch('/api/bot/stop', {method: 'POST'})).json();
+    alert('⏸️ ' + r.msg);
+  } catch (e) { alert('❌ ' + e.message); }
+}
+
+async function closeAll() {
+  if (!confirm('БҮХ нээлттэй позицыг хаах уу?')) return;
+  try {
+    const r = await (await fetch('/api/bot/close_all', {method: 'POST'})).json();
+    alert('Хаагдлаа: ' + JSON.stringify(r.closed));
+    loadTrades();
+  } catch (e) { alert('❌ ' + e.message); }
+}
+
+socket.on('connect', () => {
+  console.log('✅ Socket холбогдлоо');
+});
+
+socket.on('update', msg => {
+  try {
+    if (msg.type === 'tick') {
+      updateUI(msg.data);
+    } else if (msg.type === 'log') {
+      const div = document.getElementById('logs');
+      const lvl = msg.data.level || 'INFO';
+      const ts = (msg.data.ts || '').slice(11, 19);
+      const color = lvl === 'ERROR' ? 'red' : lvl === 'WARNING' ? 'yellow' : 'green';
+      div.innerHTML += `<div class="${color}">[${ts}] ${lvl}: ${msg.data.msg}</div>`;
+      div.scrollTop = div.scrollHeight;
+      while (div.children.length > 100) div.removeChild(div.firstChild);
+    } else if (msg.type === 'position_opened' || msg.type === 'position_closed') {
+      loadTrades();
+    }
+  } catch (e) { console.error('socket handler:', e); }
+});
+
+socket.on('disconnect', () => {
+  console.log('⚠️ Холболт тасарлаа');
+});
+
+document.addEventListener('DOMContentLoaded', () => {
+  initChart();
+  loadTrades();
+  loadConfig();
+  setInterval(loadTrades, 3000);
+});
+</script>
+{% endif %}
+</body></html>'''
+
+# ════════════════════════════════════════════════════════════════
+# 14. ROUTES — Вэб хуудсууд болон API
+# ════════════════════════════════════════════════════════════════
+def require_login(f):
+    from functools import wraps
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        if not session.get('logged_in'):
+            return jsonify({'error': 'login required'}), 401
+        return f(*args, **kwargs)
+    return wrapped
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        if check_login(request.form.get('username', ''), request.form.get('password', '')):
+            session['logged_in'] = True
+            session['username'] = request.form.get('username')
+            return redirect(url_for('dashboard'))
+        return render_template_string(HTML_TEMPLATE, logged_in=False, error='Буруу хэрэглэгч эсвэл нууц үг')
+    return render_template_string(HTML_TEMPLATE, logged_in=False)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+@app.route('/')
+def dashboard():
+    if not session.get('logged_in'):
+        return redirect(url_for('login'))
+    return render_template_string(HTML_TEMPLATE, logged_in=True)
+
+@app.route('/api/status')
+@require_login
+def api_status():
+    return jsonify(get_snapshot())
+
+@app.route('/api/trades')
+@require_login
+def api_trades():
+    try:
+        limit = int(request.args.get('limit', 50))
+        return jsonify(db_get_trades(limit=limit))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/logs')
+@require_login
+def api_logs():
+    try:
+        limit = int(request.args.get('limit', 100))
+        return jsonify(db_get_logs(limit=limit))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/config', methods=['GET', 'POST'])
+@require_login
+def api_config():
+    if request.method == 'GET':
+        cfg = load_config()
+        cfg['API_KEY_SET'] = bool(cfg.get('API_KEY'))
+        cfg.pop('API_KEY', None)
+        cfg.pop('API_SECRET', None)
+        cfg.pop('CLAUDE_API_KEY', None)
+        return jsonify(cfg)
+    try:
+        data = request.json
+        if not data:
+            return jsonify({'ok': False, 'msg': 'Өгөгдөл байхгүй'}), 400
+        cfg = load_config()
+        for k, v in data.items():
+            if k in ('API_KEY', 'API_SECRET', 'CLAUDE_API_KEY') and not v:
+                continue
+            if k in DEFAULT_CONFIG or k in ('TELEGRAM_TOKEN', 'CHAT_ID'):
+                cfg[k] = v
+        save_config(cfg)
+        STATE.config = cfg
+        return jsonify({'ok': True, 'msg': 'Хадгалагдлаа'})
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': str(e)}), 500
+
+@app.route('/api/bot/start', methods=['POST'])
+@require_login
+def api_start():
+    ok, msg = start_bot()
+    return jsonify({'ok': ok, 'msg': msg})
+
+@app.route('/api/bot/stop', methods=['POST'])
+@require_login
+def api_stop():
+    ok, msg = stop_bot()
+    return jsonify({'ok': ok, 'msg': msg})
+
+@app.route('/api/bot/close_all', methods=['POST'])
+@require_login
+def api_close_all():
+    try:
+        closed = close_all()
+        return jsonify({'ok': True, 'closed': closed})
+    except Exception as e:
+        return jsonify({'ok': False, 'msg': str(e)}), 500
+
+@app.route('/api/test_telegram', methods=['POST'])
+@require_login
+def api_test_tg():
+    send_telegram("✅ Тест мессеж — AI Bot ажиллаж байна!")
+    return jsonify({'ok': True})
+
+@app.route('/api/ai/train', methods=['POST'])
+@require_login
+def api_ai_train():
+    def task():
+        STATE.add_log('INFO', '📚 AI сургалт эхлэв...')
+        sym = STATE.config['SYMBOLS'][0] if STATE.config.get('SYMBOLS') else 'BTC/USDT:USDT'
+        ok = AI.train(sym, days=30)
+        if ok:
+            STATE.last_train = datetime.now()
+            STATE.emit('ai_trained', {'accuracy': AI.accuracy})
+            STATE.add_log('INFO', f'✅ AI сурлаа: {AI.accuracy*100:.1f}%')
+        else:
+            STATE.add_log('ERROR', '❌ AI сургалт амжилтгүй')
+    threading.Thread(target=task, daemon=True).start()
+    return jsonify({'ok': True})
+
+@socketio.on('connect')
+def on_connect():
+    if session.get('logged_in'):
+        socketio.emit('update', {'type': 'tick', 'data': get_snapshot()})
+
+# ════════════════════════════════════════════════════════════════
+# 15. MAIN — Сервер ажиллуулах
+# ════════════════════════════════════════════════════════════════
+if __name__ == '__main__':
+    print("\n" + "=" * 60)
+    print("🧠💰 ADAPTIVE AI TRADING BOT v3.0 — ВЭБ ХУВИЛБАР")
+    print("=" * 60)
+    print("📌 Хөтөч:    http://localhost:5000")
+    print("👤 Нэвтрэх: admin / admin123")
+    print("⚠️  TESTNET-ээс эхлүүлээрэй!")
+    print("=" * 60)
+    print("📦 Суулгах:")
+    print("   pip install flask flask-socketio flask-cors eventlet \\")
+    print("               ccxt pandas pandas_ta numpy scikit-learn \\")
+    print("               joblib requests anthropic")
+    print("=" * 60 + "\n")
+
+    if not AI.load() and not AI.is_trained:
+        print("⚠️  AI model байхгүй.")
+        print("    ➜ Вэб дээр 'Model сургах' товч дарна уу")
+        print("    ➜ Эсвэл bot асаахад автоматаар сурна (5-10 мин)\n")
+
+    try:
+        socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+    except KeyboardInterrupt:
+        print("\n⏹️ Bot зогслоо")
+    except Exception as e:
+        log.error(f"Сервер алдаа: {e}")
